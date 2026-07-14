@@ -27,15 +27,21 @@ import uuid as uuid_lib
 
 app = FastAPI(title="MailTrack MVP")
 
-# Autorise les appels fetch() faits depuis Gmail (mail.google.com) vers ce
-# backend. Sans ça, le navigateur bloque silencieusement les requêtes
-# fetch() par sécurité (politique CORS) — contrairement aux balises <img>,
-# qui elles ne sont jamais soumises à cette restriction, d'où le fait que
-# le pixel de tracking marchait déjà très bien sans ce middleware.
+# Autorise les appels fetch() faits depuis Gmail (mail.google.com) et
+# depuis la popup de l'extension (origine chrome-extension://..., dont
+# l'identifiant change à chaque installation) vers ce backend. Sans ça,
+# le navigateur bloque silencieusement les requêtes fetch() par sécurité
+# (politique CORS) — contrairement aux balises <img>, qui elles ne sont
+# jamais soumises à cette restriction, d'où le fait que le pixel de
+# tracking marchait déjà très bien sans ce middleware.
+#
+# ⚠️ MVP : on autorise "*" pour simplifier (l'ID d'extension change par
+# installation). À resserrer avant un vrai lancement public (ex : lister
+# précisément les origines autorisées, ou valider une clé API).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://mail.google.com"],
-    allow_methods=["POST"],
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
