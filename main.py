@@ -41,7 +41,7 @@ TRANSPARENT_GIF = bytes.fromhex(
 
 
 def get_db():
-    """Ouvre une connexion SQLite et s'assure que la table existe."""
+    """Ouvre une connexion SQLite et s'assure que les tables existent."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -52,6 +52,20 @@ def get_db():
             ip_address TEXT,
             user_agent TEXT,
             is_likely_google_proxy INTEGER DEFAULT 0
+        )
+        """
+    )
+    # Table qui retient l'adresse IP de l'expéditeur pour chaque tracking_id.
+    # Utile pour distinguer "l'expéditeur qui a lui-même chargé le pixel au
+    # moment de l'envoi" (son propre navigateur voit l'image dans le DOM
+    # avant même que le mail ne parte) d'une vraie ouverture par le
+    # destinataire.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sender_ips (
+            tracking_id TEXT PRIMARY KEY,
+            sender_ip TEXT NOT NULL,
+            registered_at TEXT NOT NULL
         )
         """
     )
@@ -108,6 +122,33 @@ async def track_open(tracking_id: str, request: Request):
     return Response(content=TRANSPARENT_GIF, media_type="image/gif")
 
 
+@app.post("/register-sender/{tracking_id}")
+async def register_sender(tracking_id: str, request: Request):
+    """
+    Appelée par l'extension juste après avoir injecté le pixel dans un email
+    (en tâche de fond, sans bloquer l'envoi). Comme cette requête part
+    directement du navigateur de l'expéditeur, l'IP vue ici EST l'IP de
+    l'expéditeur. On la stocke pour pouvoir ensuite, dans /stats, exclure
+    les événements qui viennent de cette même IP (= l'expéditeur qui a vu
+    sa propre image en la composant, pas le destinataire qui ouvre le mail).
+    """
+    sender_ip = request.client.host if request.client else "unknown"
+
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO sender_ips (tracking_id, sender_ip, registered_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(tracking_id) DO UPDATE SET sender_ip = excluded.sender_ip
+        """,
+        (tracking_id, sender_ip, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"tracking_id": tracking_id, "sender_ip_registered": True}
+
+
 @app.get("/stats/{tracking_id}")
 async def get_stats(tracking_id: str):
     """
@@ -125,26 +166,41 @@ async def get_stats(tracking_id: str):
         """,
         (tracking_id,),
     ).fetchall()
+
+    sender_row = conn.execute(
+        "SELECT sender_ip FROM sender_ips WHERE tracking_id = ?",
+        (tracking_id,),
+    ).fetchone()
     conn.close()
 
-    events = [
-        {
-            "opened_at": row[0],
-            "ip_address": row[1],
-            "user_agent": row[2],
-            "is_likely_google_proxy": bool(row[3]),
-        }
-        for row in rows
-    ]
+    sender_ip = sender_row[0] if sender_row else None
 
-    # On calcule un "vrai" nombre d'ouvertures en excluant les probables
-    # requêtes du proxy Google, pour donner un chiffre plus honnête.
-    real_opens = [e for e in events if not e["is_likely_google_proxy"]]
+    events = []
+    for row in rows:
+        ip_address = row[1]
+        is_self_view = sender_ip is not None and ip_address == sender_ip
+        events.append(
+            {
+                "opened_at": row[0],
+                "ip_address": ip_address,
+                "user_agent": row[2],
+                "is_likely_google_proxy": bool(row[3]),
+                "is_likely_self_view": is_self_view,
+            }
+        )
+
+    # Une "vraie" ouverture, c'est ni le proxy Google qui précharge l'image,
+    # ni l'expéditeur lui-même qui a vu le pixel se charger dans son propre
+    # navigateur au moment de l'envoi.
+    real_opens = [
+        e for e in events if not e["is_likely_google_proxy"] and not e["is_likely_self_view"]
+    ]
 
     return {
         "tracking_id": tracking_id,
         "total_events": len(events),
         "likely_real_opens": len(real_opens),
+        "sender_ip": sender_ip,
         "events": events,
     }
 
