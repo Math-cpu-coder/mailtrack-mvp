@@ -19,12 +19,25 @@ Et regarde les événements enregistrés :
 """
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from datetime import datetime, timezone
 import sqlite3
 import uuid as uuid_lib
 
 app = FastAPI(title="MailTrack MVP")
+
+# Autorise les appels fetch() faits depuis Gmail (mail.google.com) vers ce
+# backend. Sans ça, le navigateur bloque silencieusement les requêtes
+# fetch() par sécurité (politique CORS) — contrairement aux balises <img>,
+# qui elles ne sont jamais soumises à cette restriction, d'où le fait que
+# le pixel de tracking marchait déjà très bien sans ce middleware.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://mail.google.com"],
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
 
 DB_PATH = "tracking.db"
 
