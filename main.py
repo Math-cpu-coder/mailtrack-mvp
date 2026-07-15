@@ -2,28 +2,32 @@
 MailTrack MVP - Backend de tracking d'ouverture d'emails
 ==========================================================
 
-Ce fichier contient une seule route qui fait tout le travail :
+Ce fichier contient les routes qui font tout le travail :
 - reçoit l'appel du pixel de tracking (quand le destinataire ouvre l'email)
-- enregistre l'événement dans SQLite
+- enregistre l'événement dans une base Postgres (persistante, contrairement
+  au SQLite utilisé au tout début du projet, qui était remis à zéro à
+  chaque redémarrage du service Render gratuit)
 - renvoie un gif transparent 1x1 (invisible dans l'email)
 
-Pour lancer :
+Variable d'environnement requise :
+    DATABASE_URL — la chaîne de connexion Postgres (fournie par Render
+    quand tu crées une base "PostgreSQL", section "Internal Database URL"
+    si le backend tourne aussi sur Render).
+
+Pour lancer en local (si jamais) :
     pip install -r requirements.txt
+    export DATABASE_URL="postgresql://..."
     uvicorn main:app --reload
-
-Puis teste dans ton navigateur :
-    http://localhost:8000/track/test-123
-
-Et regarde les événements enregistrés :
-    http://localhost:8000/stats/test-123
 """
 
+import os
+import uuid as uuid_lib
+from datetime import datetime, timezone
+
+import psycopg2
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from datetime import datetime, timezone
-import sqlite3
-import uuid as uuid_lib
 
 app = FastAPI(title="MailTrack MVP")
 
@@ -45,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = "tracking.db"
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 # Le user-agent que Google utilise quand IL télécharge l'image en amont
 # (pour la mettre en cache sur ses propres serveurs). Ça arrive souvent
@@ -60,12 +64,21 @@ TRANSPARENT_GIF = bytes.fromhex(
 
 
 def get_db():
-    """Ouvre une connexion SQLite et s'assure que les tables existent."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    """Ouvre une connexion Postgres. Chaque appel ouvre sa propre connexion
+    et doit être fermé par l'appelant (pas de pool pour ce MVP — le volume
+    de requêtes reste très faible)."""
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    """Crée les tables si elles n'existent pas encore. Appelé une fois au
+    démarrage du service."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS opens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             tracking_id TEXT NOT NULL,
             opened_at TEXT NOT NULL,
             ip_address TEXT,
@@ -79,7 +92,7 @@ def get_db():
     # moment de l'envoi" (son propre navigateur voit l'image dans le DOM
     # avant même que le mail ne parte) d'une vraie ouverture par le
     # destinataire.
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS sender_ips (
             tracking_id TEXT PRIMARY KEY,
@@ -89,13 +102,13 @@ def get_db():
         """
     )
     conn.commit()
-    return conn
+    cur.close()
+    conn.close()
 
 
 @app.on_event("startup")
 def startup():
-    # Crée la base au démarrage si elle n'existe pas encore
-    get_db().close()
+    init_db()
 
 
 @app.get("/track/{tracking_id}")
@@ -120,10 +133,11 @@ async def track_open(tracking_id: str, request: Request):
     # ou d'autres clients) et ne doivent pas compter comme une "ouverture".
     if request.method == "GET":
         conn = get_db()
-        conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO opens (tracking_id, opened_at, ip_address, user_agent, is_likely_google_proxy)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """,
             (
                 tracking_id,
@@ -134,6 +148,7 @@ async def track_open(tracking_id: str, request: Request):
             ),
         )
         conn.commit()
+        cur.close()
         conn.close()
 
     # On renvoie TOUJOURS le pixel (même sur HEAD, sans body dans ce cas),
@@ -154,15 +169,17 @@ async def register_sender(tracking_id: str, request: Request):
     sender_ip = request.client.host if request.client else "unknown"
 
     conn = get_db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         INSERT INTO sender_ips (tracking_id, sender_ip, registered_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(tracking_id) DO UPDATE SET sender_ip = excluded.sender_ip
+        VALUES (%s, %s, %s)
+        ON CONFLICT (tracking_id) DO UPDATE SET sender_ip = EXCLUDED.sender_ip
         """,
         (tracking_id, sender_ip, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"tracking_id": tracking_id, "sender_ip_registered": True}
@@ -171,25 +188,29 @@ async def register_sender(tracking_id: str, request: Request):
 @app.get("/stats/{tracking_id}")
 async def get_stats(tracking_id: str):
     """
-    Route de debug pour voir les événements enregistrés pour un email donné.
-    Dans la vraie extension, ce sera cette route (ou une variante) qui alimentera
-    le badge "Ouvert il y a 2min" affiché dans Gmail.
+    Renvoie l'historique des événements pour un tracking_id donné, avec le
+    calcul de "vraies ouvertures probables" (en excluant le proxy Google et
+    l'expéditeur lui-même).
     """
     conn = get_db()
-    rows = conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         SELECT opened_at, ip_address, user_agent, is_likely_google_proxy
         FROM opens
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY opened_at ASC
         """,
         (tracking_id,),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
 
-    sender_row = conn.execute(
-        "SELECT sender_ip FROM sender_ips WHERE tracking_id = ?",
+    cur.execute(
+        "SELECT sender_ip FROM sender_ips WHERE tracking_id = %s",
         (tracking_id,),
-    ).fetchone()
+    )
+    sender_row = cur.fetchone()
+    cur.close()
     conn.close()
 
     sender_ip = sender_row[0] if sender_row else None
@@ -228,8 +249,6 @@ async def get_stats(tracking_id: str):
 async def generate_tracking_id():
     """
     Petit endpoint utilitaire : génère un UUID pour un nouvel email à tracker.
-    Plus tard, l'extension appellera cette route juste avant l'envoi du mail,
-    puis injectera <img src="http://ton-domaine/track/{tracking_id}"> dedans.
     """
     new_id = str(uuid_lib.uuid4())
     return {"tracking_id": new_id}
