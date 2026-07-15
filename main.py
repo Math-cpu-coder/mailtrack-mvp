@@ -66,14 +66,32 @@ TRANSPARENT_GIF = bytes.fromhex(
 def get_db():
     """Ouvre une connexion Postgres. Chaque appel ouvre sa propre connexion
     et doit être fermé par l'appelant (pas de pool pour ce MVP — le volume
-    de requêtes reste très faible)."""
-    return psycopg2.connect(DATABASE_URL)
+    de requêtes reste très faible).
+
+    connect_timeout=10 : sans ça, si la connexion bloque (mauvaise config
+    réseau, base pas encore prête, etc.), l'appel peut attendre
+    indéfiniment sans jamais échouer ni réussir — ce qui empêchait Render
+    de détecter que le service avait démarré (timeout de 15 min observé).
+    Avec cette limite, on échoue vite et clairement à la place.
+    """
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 
 def init_db():
     """Crée les tables si elles n'existent pas encore. Appelé une fois au
-    démarrage du service."""
-    conn = get_db()
+    démarrage du service.
+
+    On attrape toute exception ici plutôt que de laisser planter le
+    démarrage : mieux vaut un service qui répond (même avec un message
+    d'erreur clair sur /) qu'un démarrage qui timeout silencieusement côté
+    Render sans aucune info exploitable dans les logs.
+    """
+    try:
+        conn = get_db()
+    except Exception as exc:
+        print(f"[MailTrack] ERREUR de connexion à Postgres au démarrage : {exc!r}")
+        raise
+
     cur = conn.cursor()
     cur.execute(
         """
