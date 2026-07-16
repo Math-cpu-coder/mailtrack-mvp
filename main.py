@@ -21,6 +21,7 @@ Pour lancer en local (si jamais) :
 """
 
 import ipaddress
+import json as jsonlib
 import os
 import uuid as uuid_lib
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 import psycopg2
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI(title="MailTrack MVP")
 
@@ -94,6 +95,22 @@ SESSION_GROUPING_WINDOW_SECONDS = 30
 TRANSPARENT_GIF = bytes.fromhex(
     "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
 )
+
+# --- Freemium ---
+# Nombre d'emails trackés gratuits par utilisateur et par mois calendaire.
+# Au-delà, l'email part quand même normalement, mais sans pixel de
+# tracking (voir content.js côté extension) — on ne bloque jamais l'envoi
+# d'un email, seulement le tracking en lui-même.
+FREE_MONTHLY_LIMIT = 5
+
+# --- Stripe ---
+# Ces variables restent vides tant que le compte Stripe n'a pas été créé
+# et configuré sur Render (voir /create-checkout-session et
+# /stripe-webhook). En attendant, ces routes répondent une erreur claire
+# plutôt que de planter.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 
 def is_google_ip(ip_address: str) -> bool:
@@ -169,6 +186,30 @@ def init_db():
         )
         """
     )
+    # Associe chaque email tracké à un utilisateur (identifiant anonyme
+    # généré et conservé côté extension). Sert à calculer le quota mensuel
+    # freemium : on compte combien de tracking_id distincts un user_id a
+    # créés dans le mois calendaire en cours.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tracked_emails (
+            tracking_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    # Présence d'une ligne = l'utilisateur a un abonnement payant actif.
+    # Remplie par le webhook Stripe (/stripe-webhook) une fois Stripe
+    # configuré ; vide pour l'instant.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS premium_users (
+            user_id TEXT PRIMARY KEY,
+            activated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -177,6 +218,33 @@ def init_db():
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+def compute_usage(cur, user_id: str) -> dict:
+    """Calcule le quota d'un utilisateur pour le mois calendaire en cours.
+
+    On utilise une comparaison de préfixe sur la date ISO (ex: "2026-07")
+    plutôt qu'un vrai calcul de dates : les timestamps sont stockés au
+    format ISO 8601 (YYYY-MM-DD...), donc comparer les 7 premiers
+    caractères revient à comparer "même année et même mois", simplement.
+    """
+    month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    cur.execute(
+        "SELECT COUNT(*) FROM tracked_emails WHERE user_id = %s AND created_at LIKE %s",
+        (user_id, f"{month_prefix}%"),
+    )
+    used = cur.fetchone()[0]
+
+    cur.execute("SELECT 1 FROM premium_users WHERE user_id = %s", (user_id,))
+    is_premium = cur.fetchone() is not None
+
+    return {
+        "used": used,
+        "limit": FREE_MONTHLY_LIMIT,
+        "is_premium": is_premium,
+        "remaining": None if is_premium else max(0, FREE_MONTHLY_LIMIT - used),
+    }
 
 
 @app.get("/track/{tracking_id}")
@@ -233,8 +301,24 @@ async def register_sender(tracking_id: str, request: Request):
     l'expéditeur. On la stocke pour pouvoir ensuite, dans /stats, exclure
     les événements qui viennent de cette même IP (= l'expéditeur qui a vu
     sa propre image en la composant, pas le destinataire qui ouvre le mail).
+
+    Si le corps de la requête contient un "user_id" (identifiant anonyme
+    généré côté extension), on enregistre aussi cet email comme tracké par
+    cet utilisateur, ce qui alimente le calcul du quota freemium retourné
+    dans la réponse.
     """
     sender_ip = request.client.host if request.client else "unknown"
+
+    raw_body = await request.body()
+    payload = {}
+    if raw_body:
+        try:
+            payload = jsonlib.loads(raw_body)
+        except ValueError:
+            payload = {}
+    user_id = payload.get("user_id")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     conn = get_db()
     cur = conn.cursor()
@@ -244,13 +328,38 @@ async def register_sender(tracking_id: str, request: Request):
         VALUES (%s, %s, %s)
         ON CONFLICT (tracking_id) DO UPDATE SET sender_ip = EXCLUDED.sender_ip
         """,
-        (tracking_id, sender_ip, datetime.now(timezone.utc).isoformat()),
+        (tracking_id, sender_ip, now_iso),
     )
+
+    usage = None
+    if user_id:
+        cur.execute(
+            """
+            INSERT INTO tracked_emails (tracking_id, user_id, created_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tracking_id) DO NOTHING
+            """,
+            (tracking_id, user_id, now_iso),
+        )
+        usage = compute_usage(cur, user_id)
+
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"tracking_id": tracking_id, "sender_ip_registered": True}
+    return {"tracking_id": tracking_id, "sender_ip_registered": True, "usage": usage}
+
+
+@app.get("/usage/{user_id}")
+async def get_usage(user_id: str):
+    """Renvoie le quota freemium actuel d'un utilisateur (utilisé par la
+    popup du dashboard pour afficher "X/5 emails trackés ce mois-ci")."""
+    conn = get_db()
+    cur = conn.cursor()
+    usage = compute_usage(cur, user_id)
+    cur.close()
+    conn.close()
+    return usage
 
 
 @app.get("/stats/{tracking_id}")
@@ -324,6 +433,86 @@ async def get_stats(tracking_id: str):
         "sender_ip": sender_ip,
         "events": events,
     }
+
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(request: Request):
+    """
+    Crée une session de paiement Stripe pour passer un utilisateur en
+    Premium (illimité). Tant que STRIPE_SECRET_KEY / STRIPE_PRICE_ID ne
+    sont pas configurées sur Render, cette route renvoie une erreur claire
+    plutôt qu'une exception brute — le bouton "Passer Premium" de la popup
+    l'affichera tel quel à l'utilisateur.
+    """
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        return JSONResponse(
+            status_code=501,
+            content={"error": "Le paiement n'est pas encore configuré. Réessaie plus tard."},
+        )
+
+    import stripe
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    payload = await request.json()
+    user_id = payload.get("user_id")
+    if not user_id:
+        return JSONResponse(status_code=400, content={"error": "user_id manquant."})
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url="https://mail.google.com/mail/u/0/#inbox",
+        cancel_url="https://mail.google.com/mail/u/0/#inbox",
+        # Permet au webhook de retrouver quel utilisateur vient de payer.
+        client_reference_id=user_id,
+    )
+
+    return {"checkout_url": session.url}
+
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    """
+    Reçoit les événements Stripe (notamment "paiement réussi") pour
+    marquer un utilisateur comme Premium. Tant que STRIPE_WEBHOOK_SECRET
+    n'est pas configurée, cette route ne fait rien d'utilisable — à
+    activer une fois le compte Stripe et le webhook créés.
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        return JSONResponse(
+            status_code=501, content={"error": "Webhook Stripe non configuré."}
+        )
+
+    import stripe
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": f"Signature invalide : {exc}"})
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("client_reference_id")
+        if user_id:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO premium_users (user_id, activated_at)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+
+    return {"received": True}
 
 
 @app.post("/generate-id")
