@@ -20,6 +20,7 @@ Pour lancer en local (si jamais) :
     uvicorn main:app --reload
 """
 
+import ipaddress
 import os
 import uuid as uuid_lib
 from datetime import datetime, timezone
@@ -51,16 +52,65 @@ app.add_middleware(
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Le user-agent que Google utilise quand IL télécharge l'image en amont
-# (pour la mettre en cache sur ses propres serveurs). Ça arrive souvent
-# dans les 1-2 secondes après l'envoi, PAS quand le destinataire ouvre
-# vraiment le mail. Il faut filtrer ça pour ne pas compter un "faux positif".
+# Le user-agent que Google utilise parfois quand IL télécharge l'image en
+# amont (pour la mettre en cache sur ses propres serveurs). Ça arrive
+# souvent dans les 1-2 secondes après l'envoi, PAS quand le destinataire
+# ouvre vraiment le mail. Il faut filtrer ça pour ne pas compter un "faux
+# positif". On a constaté que ce marqueur n'est pas TOUJOURS présent dans
+# le user-agent (Google ne l'ajoute pas systématiquement) — d'où l'ajout
+# ci-dessous d'une détection complémentaire par plage d'IP, plus fiable.
 GOOGLE_PROXY_MARKERS = ["GoogleImageProxy", "via ggpht.com"]
+
+# Plages d'IP connues appartenant à Google (utilisées entre autres par leurs
+# proxys de préchargement d'images dans Gmail). Liste non exhaustive
+# (Google en possède beaucoup d'autres, et ça évolue), mais elle couvre les
+# plages les plus fréquemment vues dans ce genre de trafic. À défaut d'une
+# API officielle simple pour ça, c'est une heuristique "best effort" — le
+# but est de réduire les faux négatifs du filtre par user-agent, pas
+# d'être parfaitement exhaustif.
+GOOGLE_IP_RANGES = [
+    ipaddress.ip_network(cidr)
+    for cidr in [
+        "66.102.0.0/20",
+        "74.125.0.0/16",
+        "108.177.8.0/21",
+        "142.250.0.0/15",
+        "172.217.0.0/16",
+        "172.253.0.0/16",
+        "209.85.128.0/17",
+        "216.58.0.0/16",
+        "64.233.160.0/19",
+        "35.190.0.0/17",
+    ]
+]
+
+# Si deux événements "réels" (ni proxy, ni auto-vue de l'expéditeur)
+# arrivent à moins de X secondes d'intervalle, on considère que c'est la
+# même session de lecture (ex : plusieurs images/ressources se rechargent
+# en un coup d'œil) plutôt que deux ouvertures distinctes du mail.
+SESSION_GROUPING_WINDOW_SECONDS = 30
 
 # Le plus petit gif transparent valide qui existe (1x1 pixel), en bytes bruts.
 TRANSPARENT_GIF = bytes.fromhex(
     "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
 )
+
+
+def is_google_ip(ip_address: str) -> bool:
+    """Vérifie si une IP appartient à une plage connue de Google."""
+    try:
+        ip = ipaddress.ip_address(ip_address)
+    except ValueError:
+        return False
+    return any(ip in network for network in GOOGLE_IP_RANGES)
+
+
+def is_likely_google_proxy(user_agent: str, ip_address: str) -> bool:
+    """Combine la détection par user-agent (historique) et par plage d'IP
+    (plus fiable, ajoutée après avoir constaté que Google n'ajoute pas
+    toujours son marqueur dans le user-agent)."""
+    has_marker = any(marker in user_agent for marker in GOOGLE_PROXY_MARKERS)
+    return has_marker or is_google_ip(ip_address)
 
 
 def get_db():
@@ -144,7 +194,7 @@ async def track_open(tracking_id: str, request: Request):
     user_agent = request.headers.get("user-agent", "")
     ip_address = request.client.host if request.client else "unknown"
 
-    is_proxy = any(marker in user_agent for marker in GOOGLE_PROXY_MARKERS)
+    is_proxy = is_likely_google_proxy(user_agent, ip_address)
 
     # On n'enregistre l'événement que pour les vraies requêtes GET.
     # Les requêtes HEAD sont juste des vérifications techniques (par Gmail
@@ -254,10 +304,23 @@ async def get_stats(tracking_id: str):
         e for e in events if not e["is_likely_google_proxy"] and not e["is_likely_self_view"]
     ]
 
+    # Regroupe les "vraies ouvertures" rapprochées dans le temps en une
+    # seule "session de lecture" — évite de compter 3 ou 4 "ouvertures"
+    # quand il s'agit en fait d'un seul coup d'œil au mail qui déclenche
+    # plusieurs rechargements de ressources en quelques secondes.
+    open_sessions = 0
+    previous_time = None
+    for event in real_opens:
+        current_time = datetime.fromisoformat(event["opened_at"])
+        if previous_time is None or (current_time - previous_time).total_seconds() > SESSION_GROUPING_WINDOW_SECONDS:
+            open_sessions += 1
+        previous_time = current_time
+
     return {
         "tracking_id": tracking_id,
         "total_events": len(events),
         "likely_real_opens": len(real_opens),
+        "open_sessions": open_sessions,
         "sender_ip": sender_ip,
         "events": events,
     }
